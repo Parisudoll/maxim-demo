@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Maxim</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; background:#000; overflow:hidden;
+    font-family: 'Times New Roman', Georgia, serif; color:#e8e0d4; }
+  #stage { position:fixed; inset:0; }
+
+  /* --- background video (revealed at the end) --- */
+  #bgVideo {
+    position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover; z-index:1; opacity:0;
+    transition: opacity 1.2s ease;
+  }
+  #bgVideo.visible { opacity:1; }
+
+  /* --- frosted glass overlay (blur + tint + grain) --- */
+  #frosted {
+    position:absolute; inset:0; z-index:2;
+    backdrop-filter: blur(24px) saturate(1.1);
+    -webkit-backdrop-filter: blur(24px) saturate(1.1);
+    background: rgba(4,4,4,0.98);
+    opacity:0;
+    pointer-events:none;
+  }
+  #grain {
+    position:absolute; inset:0; z-index:3; opacity:0;
+    mix-blend-mode: overlay; pointer-events:none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+  }
+
+  /* --- three.js canvas layer (top) --- */
+  #scene { position:absolute; inset:0; z-index:4; display:block; width:100%; height:100%; }
+
+  /* --- HUD --- */
+  #hud {
+    position:absolute; z-index:5; inset:0;
+    pointer-events:none;
+  }
+  #counter {
+    position:absolute; top:22px; right:22px;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size:11px; letter-spacing:0.18em; text-transform:uppercase;
+    color: #d4a24a; opacity:0;
+    transition: opacity 0.6s ease 0.4s;
+  }
+  #counter.show { opacity:1; }
+  #hint {
+    position:absolute; bottom:28px; left:50%; transform:translateX(-50%);
+    font-size:11px; letter-spacing:0.32em; text-transform:uppercase;
+    color: rgba(232,224,212,0.35);
+    opacity:0; transition: opacity 0.8s ease;
+  }
+  #hint.show { opacity:1; }
+
+  /* --- loading --- */
+  #loading {
+    position:absolute; inset:0; z-index:10; display:flex;
+    align-items:center; justify-content:center;
+    background:#000; color:#8a8072;
+    font-size:11px; letter-spacing:0.32em; text-transform:uppercase;
+    transition: opacity 0.6s ease;
+  }
+  #loading.hide { opacity:0; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="bgVideo" src="assets/bg.mp4" muted loop playsinline preload="auto"></video>
+  <div id="frosted"></div>
+  <div id="grain"></div>
+  <canvas id="scene"></canvas>
+  <div id="hud">
+    <div id="counter">— · 30s para el lanzamiento</div>
+    <div id="hint">tocá el cristal</div>
+  </div>
+  <div id="loading">cargando</div>
+</div>
+
+<!-- Import map so we can use "three" bare specifier -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { gsap } from 'https://unpkg.com/gsap@3.12.5/index.js';
+
+const $ = (id) => document.getElementById(id);
+
+// ---------- Scene setup ----------
+const canvas = $('scene');
+const stage = $('stage');
+let W = stage.clientWidth, H = stage.clientHeight;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, W/H, 0.1, 100);
+camera.position.set(0, 0, 5);
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(W, H, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+// Studio-ish environment (for the clearcoat reflections on the logo)
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+// Zenith light (main dramatic light from above)
+const zenith = new THREE.DirectionalLight(0xffffff, 2.2);
+zenith.position.set(0, 6, 1.5);
+scene.add(zenith);
+
+// Fill (very soft, warm) so the crystal doesn't go pitch black at edges
+const fill = new THREE.DirectionalLight(0xffd8a0, 0.25);
+fill.position.set(-3, 1, 2);
+scene.add(fill);
+
+// Ambient at very low level
+scene.add(new THREE.AmbientLight(0xffffff, 0.08));
+
+// Cursor-tracking light (used for the logo's moving highlight)
+const shine = new THREE.PointLight(0xffffff, 0, 8, 2);
+shine.position.set(0, 0, 3);
+scene.add(shine);
+
+// ---------- Loading assets ----------
+const loader = new GLTFLoader();
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/');
+loader.setDRACOLoader(draco);
+
+let crystal, logo;
+
+function loadGLB(url){
+  return new Promise((res, rej) => loader.load(url, g => res(g.scene), undefined, rej));
+}
+
+function fitAndCenter(obj, targetSize){
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const center = new THREE.Vector3(); box.getCenter(center);
+  obj.position.sub(center);
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const s = targetSize / maxDim;
+  obj.scale.setScalar(s);
+}
+
+// ---------- Materials ----------
+// Crystal: dark translucent solid that shifts to amber on hover.
+// Not literal glass — a dense hardened substance (per the balm concept).
+const crystalMat = new THREE.MeshPhysicalMaterial({
+  color: new THREE.Color('#0a0906'),
+  roughness: 0.28,
+  metalness: 0.0,
+  transmission: 0.15,      // slight translucency even when black
+  thickness: 1.2,
+  ior: 1.55,
+  clearcoat: 0.6,
+  clearcoatRoughness: 0.18,
+  attenuationColor: new THREE.Color('#0a0906'),
+  attenuationDistance: 1.4,
+  emissive: new THREE.Color('#000000'),
+  emissiveIntensity: 0.0,
+});
+
+// Amber target values (animated to on hover)
+const amberTarget = {
+  color: new THREE.Color('#d4a24a'),
+  attenuationColor: new THREE.Color('#c17a1f'),
+  emissive: new THREE.Color('#4a2508'),
+  emissiveIntensity: 0.35,
+  transmission: 0.55,
+};
+const blackTarget = {
+  color: new THREE.Color('#0a0906'),
+  attenuationColor: new THREE.Color('#0a0906'),
+  emissive: new THREE.Color('#000000'),
+  emissiveIntensity: 0.0,
+  transmission: 0.15,
+};
+
+// Logo: patent leather black. Deep base + strong clearcoat for wet reflections.
+const logoMat = new THREE.MeshPhysicalMaterial({
+  color: new THREE.Color('#020202'),
+  roughness: 0.35,
+  metalness: 0.05,
+  clearcoat: 1.0,
+  clearcoatRoughness: 0.06,
+  reflectivity: 1.0,
+});
+
+// ---------- Load, replace materials, add to scene ----------
+Promise.all([
+  loadGLB('assets/crystal.glb'),
+  loadGLB('assets/logo.glb'),
+]).then(([c, l]) => {
+  crystal = c;
+  logo = l;
+
+  crystal.traverse(o => { if(o.isMesh){ o.material = crystalMat; o.geometry.computeVertexNormals(); } });
+  logo.traverse(o => { if(o.isMesh){ o.material = logoMat; o.geometry.computeVertexNormals(); } });
+
+  fitAndCenter(crystal, 2.4);
+  fitAndCenter(logo, 2.6);
+
+  scene.add(crystal);
+  logo.visible = false;
+  logo.scale.multiplyScalar(0.01); // start collapsed
+  scene.add(logo);
+
+  $('loading').classList.add('hide');
+  gsap.delayedCall(0.6, () => $('hint').classList.add('show'));
+}).catch(err => {
+  $('loading').textContent = 'error cargando assets — revisá la consola';
+  console.error(err);
+});
+
+// ---------- Interaction ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let hovering = false;
+let phase = 'crystal'; // crystal → transition → logo → countdown → revealed
+
+function setPointer(e){
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX ?? (e.touches && e.touches[0]?.clientX);
+  const cy = e.clientY ?? (e.touches && e.touches[0]?.clientY);
+  if(cx == null) return;
+  pointer.x = ((cx - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((cy - rect.top) / rect.height) * 2 + 1;
+}
+
+function toAmber(){
+  gsap.to(crystalMat.color, { r:amberTarget.color.r, g:amberTarget.color.g, b:amberTarget.color.b, duration:0.7 });
+  gsap.to(crystalMat.attenuationColor, { r:amberTarget.attenuationColor.r, g:amberTarget.attenuationColor.g, b:amberTarget.attenuationColor.b, duration:0.7 });
+  gsap.to(crystalMat.emissive, { r:amberTarget.emissive.r, g:amberTarget.emissive.g, b:amberTarget.emissive.b, duration:0.7 });
+  gsap.to(crystalMat, { emissiveIntensity: amberTarget.emissiveIntensity, transmission: amberTarget.transmission, duration:0.7 });
+}
+function toBlack(){
+  gsap.to(crystalMat.color, { r:blackTarget.color.r, g:blackTarget.color.g, b:blackTarget.color.b, duration:0.9 });
+  gsap.to(crystalMat.attenuationColor, { r:blackTarget.attenuationColor.r, g:blackTarget.attenuationColor.g, b:blackTarget.attenuationColor.b, duration:0.9 });
+  gsap.to(crystalMat.emissive, { r:blackTarget.emissive.r, g:blackTarget.emissive.g, b:blackTarget.emissive.b, duration:0.9 });
+  gsap.to(crystalMat, { emissiveIntensity: blackTarget.emissiveIntensity, transmission: blackTarget.transmission, duration:0.9 });
+}
+
+function checkCrystalHover(){
+  if(!crystal) return;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObject(crystal, true).length > 0;
+  if(hit && !hovering){ hovering = true; toAmber(); }
+  else if(!hit && hovering){ hovering = false; toBlack(); }
+}
+
+canvas.addEventListener('pointermove', (e)=>{
+  setPointer(e);
+  if(phase === 'crystal') checkCrystalHover();
+  if(phase === 'logo' || phase === 'countdown' || phase === 'revealed'){
+    // move the "shine" light on a plane in front of the logo
+    shine.position.x = pointer.x * 3.2;
+    shine.position.y = pointer.y * 2.4;
+    shine.position.z = 3.0;
+  }
+});
+
+canvas.addEventListener('pointerdown', (e)=>{
+  setPointer(e);
+  if(phase !== 'crystal') return;
+  raycaster.setFromCamera(pointer, camera);
+  if(!crystal || raycaster.intersectObject(crystal, true).length === 0) return;
+  transitionToLogo();
+});
+
+// ---------- Transition: crystal → logo + reveal video + start countdown ----------
+function transitionToLogo(){
+  phase = 'transition';
+  $('hint').classList.remove('show');
+
+  // Start playing the background video (autoplay muted works on iOS)
+  const video = $('bgVideo');
+  video.play().catch(()=>{});
+
+  const tl = gsap.timeline({ onComplete: () => {
+    phase = 'logo';
+    startCountdown();
+  }});
+
+  // Force crystal to amber first, then collapse
+  toAmber();
+  tl.to(crystal.scale, { x:0.001, y:0.001, z:0.001, duration:0.55, ease:'power2.in' }, 0.15)
+    .call(()=>{ crystal.visible = false; logo.visible = true; }, null, '>')
+    .to(logo.scale, { x: logo.userData.targetScale || 1, y: 1, z: 1, duration:0.9, ease:'back.out(1.4)' }, '<')
+    // fade in the video behind everything
+    .call(()=>{ video.classList.add('visible'); }, null, '<')
+    // frosted glass appears fully black at first (video still fully hidden)
+    .to('#frosted', { opacity: 1, duration: 0.5, ease:'power2.out' }, '<')
+    .to('#grain',   { opacity: 0.42, duration: 0.6, ease:'power2.out' }, '<')
+    // turn on the moving shine light for the logo
+    .to(shine, { intensity: 2.4, duration: 0.6 }, '<0.2');
+}
+
+// Capture logo's fitted scale before the transition zeros it
+// (fitAndCenter has already run — its scale is what we want to land on)
+// We stash it once loaded:
+const stashLogoScale = setInterval(()=>{
+  if(logo){
+    logo.userData.targetScale = logo.scale.x; // uniform scale
+    // then reset back to zero for the intro
+    logo.scale.setScalar(0.001);
+    clearInterval(stashLogoScale);
+  }
+}, 50);
+
+// ---------- Countdown + frosted-glass progressive reveal ----------
+// Demo: 30 seconds total. During the countdown, the tinted glass goes:
+//   0-60%   black → amber (staying opaque)
+//   60-100% amber → transparent (video is revealed)
+const DEMO_SECONDS = 30;
+let countdownStart = 0;
+
+function startCountdown(){
+  phase = 'countdown';
+  $('counter').classList.add('show');
+  countdownStart = performance.now();
+}
+
+// Color interpolation helpers
+function mix(a, b, t){ return a + (b - a) * t; }
+function rgbToStr(r,g,b,a){ return `rgba(${r|0},${g|0},${b|0},${a})`; }
+
+const BLACK = { r: 4,   g: 4,   b: 4 };
+const AMBER = { r: 193, g: 122, b: 31 };
+
+function updateFrosted(elapsed){
+  const t = Math.min(elapsed / DEMO_SECONDS, 1); // 0..1
+  const frosted = $('frosted');
+  const grain = $('grain');
+
+  let bg, blur, alpha, grainOp;
+  if(t < 0.6){
+    // black → amber, still opaque
+    const k = t / 0.6;
+    const r = mix(BLACK.r, AMBER.r, k);
+    const g = mix(BLACK.g, AMBER.g, k);
+    const b = mix(BLACK.b, AMBER.b, k);
+    frosted.style.background = rgbToStr(r,g,b, 0.94);
+    blur = 24;
+    grainOp = 0.42;
+  } else {
+    // amber → clear (alpha fades, blur reduces, grain fades)
+    const k = (t - 0.6) / 0.4;
+    frosted.style.background = rgbToStr(AMBER.r, AMBER.g, AMBER.b, 0.94 * (1 - k));
+    blur = 24 * (1 - k);
+    grainOp = 0.42 * (1 - k);
+  }
+  frosted.style.backdropFilter = `blur(${blur}px) saturate(1.1)`;
+  frosted.style.webkitBackdropFilter = `blur(${blur}px) saturate(1.1)`;
+  grain.style.opacity = grainOp.toFixed(3);
+
+  // counter text
+  const remaining = Math.max(0, DEMO_SECONDS - elapsed);
+  $('counter').textContent = `${remaining.toFixed(0).padStart(2,'0')} · seg para el lanzamiento`;
+
+  if(t >= 1 && phase === 'countdown'){
+    phase = 'revealed';
+    $('counter').textContent = 'lanzamiento';
+  }
+}
+
+// ---------- Animation loop ----------
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+
+  if(crystal && phase === 'crystal'){
+    crystal.rotation.y += 0.0035;
+    crystal.position.y = Math.sin(t * 1.1) * 0.12;
+  }
+  if(logo && (phase === 'logo' || phase === 'countdown' || phase === 'revealed')){
+    logo.rotation.y += 0.002;
+    logo.position.y = Math.sin(t * 0.9) * 0.08;
+  }
+
+  if(phase === 'countdown' || phase === 'revealed'){
+    const elapsed = (performance.now() - countdownStart) / 1000;
+    updateFrosted(elapsed);
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------- Resize ----------
+window.addEventListener('resize', ()=>{
+  W = stage.clientWidth; H = stage.clientHeight;
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  renderer.setSize(W, H, false);
+});
+
+// ---------- Safety net: show errors on screen ----------
+window.addEventListener('error', (e)=>{
+  const l = $('loading');
+  l.classList.remove('hide');
+  l.textContent = 'error: ' + (e.message || 'desconocido');
+});
+</script>
+</body>
+</html>
